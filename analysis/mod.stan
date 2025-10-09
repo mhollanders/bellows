@@ -26,16 +26,20 @@ functions {
 
 data {
   array[2] int<lower=0> N;  // number of drone counts and ARU observations
-  int<lower=0> I, J, X, B_max;  // number of observations, sites, and covariates, and maximum number of bellows
+  int<lower=0> I, J, R, X, B_max;  // number of sites, surveys, regions, and covariates, and maximum number of bellows
   array[N[2]] int<lower=1, upper=I> site;  // site indicator
+  array[I] int<lower=1, upper=R> region_i;  // region indicator for sites
+  array[J] int<lower=1, upper=R> region_j;  // region indicator for survey
   array[N[2]] int<lower=1, upper=J> survey;  // survey indicator
   array[N[1]] int<lower=0> C;  // drone counts
   array[N[2]] int<lower=0> B;  // number of bellows
-  row_vector<lower=0>[N[2]] Delta;  // drone survey lengths (hours)
+  row_vector<lower=0>[N[1]] area;  // areas surveyed with drones
+  row_vector<lower=0>[N[2]] Delta;  // ARU survey lengths (hours)
   array[N[2]] vector<lower=0>[B_max + 1] y;  // waiting times between bellows
   matrix[X, N[2]] x;  // covariates
   array[2] int<lower=0, upper=1> NB;  // indicators for negative binomial
   int<lower=0, upper=1> HP;  // indicator for Hawkes process
+  int<lower=0> pred;  // number of predictions
 }
 
 transformed data {
@@ -46,13 +50,17 @@ transformed data {
     tau[n, :Bp_1[n]] = Delta[n] - cumulative_sum(y[n, :Bp_1[n]]);
   }
   int idx = NB[1] ? 2 : 1;  // index for negative binomial overdispersion for bellows
+  real r_scale = inv(sqrt(1 - inv(R)));
 }
 
 parameters {
-  vector<lower=0>[2] gamma0;  // intercepts (original scale)
+  vector<lower=0>[2] gamma0;  // intercepts (original scale) and scales
+  array[2] sum_to_zero_vector[R] gamma0_r;  // region-level offsets
   vector<lower=0, upper=1>[2] R2;  // R-squared
-  row_stochastic_matrix[2, X + 2] zeta;  // variance partitions
-  array[2] cholesky_factor_corr[2] Omega_L;  // Cholesky factors of correlation matrices
+  row_stochastic_matrix[2, X + 3] zeta;  // variance partitions
+  vector<lower=-1, upper=1>[2] rho_a;  // site and survey correlations
+  vector<lower=0>[2] rho_t;  // scales
+  array[2] sum_to_zero_vector[R] rho_r;  // region-level offsets
   matrix[2, X + I + J] z;  // standard normal variates for coefficients and random effects
   vector<lower=0>[sum(NB)] phi;  // negative binomial overdispersion
   row_vector<lower=0>[NB[2] * N[2]] u;  // negative binomial variates
@@ -64,33 +72,56 @@ transformed parameters {
   vector[2] tau2 = R2 ./ (1 - R2), pseudo_var = inv(gamma0);
   pseudo_var[1] += NB[1] ? inv(phi[1]) : 0;
   pseudo_var[2] += NB[2] ? inv(phi[idx]) : 0;
-  matrix[2, X + 2] scales = sqrt(diag_pre_multiply(tau2 .* pseudo_var, zeta));
+  matrix[2, X + 3] scales = sqrt(diag_pre_multiply(tau2 .* pseudo_var, zeta));
   
-  // coefficients and random site and survey effects
-  matrix[2, X] gamma = scales[:, 1:X] .* z[:, :X];
-  matrix[2, I] theta = diag_pre_multiply(scales[:, X + 1], Omega_L[1])
-                       * z[:, (X + 1):(X + I)];
-  matrix[2, J] epsilon = diag_pre_multiply(scales[:, X + 2], Omega_L[2])
-                         * z[:, X + I + 1:X + I + J];
+  // coefficients and random region, site, and survey effects
+  matrix[2, X] gamma = scales[:, :X] .* z[:, :X];
+  matrix[R, 2] rho;
+  matrix[2, I] theta = rep_matrix(log(gamma0), I);
+  matrix[2, J] epsilon;
+  {
+    matrix[2, 2] O = diag_matrix(ones_vector(2));
+    array[2, R] matrix[2, 2] S_L;
+    for (d in 1:2) {
+      rho[:, d] = tanh(atanh(rho_a[d]) + rho_t[d] * rho_r[d]);
+      for (r in 1:R) {
+        O[1, 2] = rho[r, d];
+        O[2, 1] = rho[r, d];
+        S_L[d, r] = diag_pre_multiply(scales[:, X + d], cholesky_decompose(O));
+      }
+      theta[d] += scales[d, X + 3] * gamma0_r[d, region_i]';
+    }
+    for (i in 1:I) {
+      theta[:, i] += S_L[1, region_i[i]] * z[:, X + i];
+    }
+    for (j in 1:J) {
+      epsilon[:, j] = S_L[2, region_j[j]] * z[:, X + I + j];
+    }
+  }
   
   // log-linear expectations including negative binomial variates
   matrix[2, N[2]] mu;
   for (d in 1:2) {
-    mu[d, :N[d]] = exp(log(gamma0[d]) 
+    mu[d, :N[d]] = exp(theta[d, site[:N[d]]]
                        + gamma[d] * x[:, :N[d]]
-                       + theta[d, site[:N[d]]]
                        + epsilon[d, survey[:N[d]]]);
   }
+  mu[1, :N[1]] .*= area;
   if (NB[2]) {
     mu[2] .*= u;
   }
   
-  // priors (gamma and Omega_L are implicit)
-  real lprior = exponential_lpdf(to_vector(gamma0) | 0.1)
+  // priors
+  real lprior = exponential_lpdf(gamma0 | 0.1)
                 + beta_lpdf(R2 | 1, 1)
-                + std_normal_lpdf(to_vector(z));
+                + std_normal_lpdf(to_vector(z))
+                + exponential_lpdf(rho_t | 2);
+  for (d in 1:2) {
+    lprior += normal_lpdf(gamma0_r[d] | 0, r_scale)
+              + normal_lpdf(rho_r[d] | 0, r_scale);
+  }
   if (sum(NB)) {
-    lprior += gamma_lpdf(phi | 2, 0.1);
+    lprior += inv_gamma_lpdf(phi | 0.4, 0.3);
     if (NB[2]) {
       lprior += gamma_lpdf(u | phi[idx], phi[idx]);
     }
@@ -121,12 +152,6 @@ model {
 }
 
 generated quantities {
-  // correlations
-  vector[2] rho;
-  for (i in 1:2) {
-    rho[i] = multiply_lower_tri_self_transpose(Omega_L[i])[1, 2];
-  }
-  
   // log likelihoods
   vector[N[1]] log_lik1;
   vector[N[2]] log_lik2, log_lik;
@@ -165,4 +190,24 @@ generated quantities {
             neg_binomial_2_rng(mu_Delta, phi[idx])
             : poisson_rng(mu_Delta);
   }
+  
+  // // posterior site-level predictions
+  // array[2] matrix[pred, 2] theta_pred;
+  // for (r in 1:2) {
+  //   real log_C0 = log(gamma0[1]) + scales[1, X + 3] .* gamma0_r[1, r],
+  //        log_B0 = log(gamma0[2]) + scales[2, X + 3] .* gamma0_r[2, r];
+  //   theta_pred[r] = append_col(linspaced_vector(pred, 0, 3),
+  //                              rep_vector(log_B0, pred));
+  //   theta_pred[r, :, 2] += rho[1, r] * scales[2, X + 1] / scales[1, X + 1]
+  //                          * (theta_pred[r, :, 1] - log_C0);
+  // }
+  
+  // posterior site-level predictions
+  matrix[pred, 2] theta_pred = append_col(linspaced_vector(pred, 0, 3),
+                                          rep_vector(log(gamma0[2]), pred));
+  theta_pred[:, 2] += rho_a[1] * scales[2, X + 1] / scales[1, X + 1]
+                      * (theta_pred[:, 1] - log(gamma0[1]));
+  array[pred] real theta_rep = normal_rng(theta_pred[:, 2],
+                                          scales[2, X + 1]
+                                          * sqrt(1 - square(rho_a[1])));
 }
