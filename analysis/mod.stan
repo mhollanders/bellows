@@ -14,7 +14,8 @@ functions {
   real hawkes_exp_lpdf(vector y, real mu, vector hp, real Delta, vector tau) {
     int D = size(y) - 1;
     vector[D] exp_neg_beta_y = exp(-hp[2] * y[1:D]);
-    vector[D] A = zeros_vector(D);
+    vector[D] A;
+    A[1] = 0;
     for (d in 2:D) {
       A[d] = exp_neg_beta_y[d] * (1 + A[d - 1]);
     }

@@ -45,7 +45,7 @@ my_theme <- function(base_size = 8,
       strip.text = element_text(
         colour = "white", 
         size = rel(0.9), 
-        margin = margin(rep(0.8 * half_line, 4))
+        margin = margin(0.8 * half_line)
       ),
       
       # Text color
